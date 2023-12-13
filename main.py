@@ -55,7 +55,7 @@ def beautifyXML(xml_files):
             with open(file=xml_file, mode='r', encoding='utf-8') as f:
                 text_lines = f.readlines()
                 lines = len(text_lines)
-            if lines < 4:
+            if lines < 10:
                 print(f'[STATUS] - Beautifying: {xml_file}')
                 text = ''.join(text_lines)
                 temp = BeautifulSoup(text, "xml") 

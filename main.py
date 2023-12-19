@@ -1,12 +1,11 @@
 import glob, subprocess, os
 from bs4 import BeautifulSoup 
+import argparse
 
-# conf
-PROJECT_FOLDER_PATH = 'D:/RESEARCH/Bitbucket-8.16.0/SOURCE-atlassian-bitbucket-8.16.0/app'
 
 # conf default settings
 VINEFLOWER_PATH = './jar/vineflower-1.9.3.jar'
-JAVA_PATH = 'D:/tools/jdk/jdk-11.0.19/bin/java.exe'
+JAVA_PATH = 'java' # default, set full path if needed
 ALL_JARS_REGEX = '/**/*.jar'
 ALL_CLASSES_REGEX = '/**/*.class'
 ALL_XML_REGEX = '/**/*.xml'
@@ -66,6 +65,18 @@ def beautifyXML(xml_files):
             print(f'[ERROR] Error beautifying: {xml_file}')
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-f', '--folder', help='Folder contain jar files')
+    args = parser.parse_args()
+
+    # conf
+    PROJECT_FOLDER_PATH = (args.folder).strip()
+    if PROJECT_FOLDER_PATH == None or PROJECT_FOLDER_PATH == '':
+        print('[ERORR] - Folder location is empty!')
+        exit()
+    else:
+        print(f'[INFO] - Location: {PROJECT_FOLDER_PATH}')
+        
     jar_files = glob.glob(PROJECT_FOLDER_PATH + ALL_JARS_REGEX, recursive=True)
     class_files = glob.glob(PROJECT_FOLDER_PATH + ALL_CLASSES_REGEX, recursive=True)
     xml_files = glob.glob(PROJECT_FOLDER_PATH + ALL_XML_REGEX, recursive=True)

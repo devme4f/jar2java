@@ -5,14 +5,14 @@ import argparse
 
 # conf default settings
 VINEFLOWER_PATH = './jar/vineflower-1.9.3.jar'
-JAVA_PATH = 'java' # default, set full path if needed
+JAVA_PATH = 'D:/tools/jdk/jdk-11.0.19/bin/java.exe' # default, set full path if needed (required jdk11)
 ALL_JARS_REGEX = '/**/*.jar'
 ALL_CLASSES_REGEX = '/**/*.class'
 ALL_XML_REGEX = '/**/*.xml'
 
 
 def decompile(jav_file, out_jav_folder):
-    command = f"{JAVA_PATH} -jar {VINEFLOWER_PATH} {jav_file} --folder {out_jav_folder}"
+    command = f"{JAVA_PATH} -Xmx6G -jar {VINEFLOWER_PATH} {jav_file} --folder {out_jav_folder}"
     print(f'[STATUS] - decompiling: {jav_file}')
     try:
         subprocess.run(command, check=True, shell=True)
@@ -78,12 +78,9 @@ if __name__ == '__main__':
         print(f'[INFO] - Location: {PROJECT_FOLDER_PATH}')
         
     jar_files = glob.glob(PROJECT_FOLDER_PATH + ALL_JARS_REGEX, recursive=True)
-    class_files = glob.glob(PROJECT_FOLDER_PATH + ALL_CLASSES_REGEX, recursive=True)
-    xml_files = glob.glob(PROJECT_FOLDER_PATH + ALL_XML_REGEX, recursive=True)
-
     decompileJars(jar_files)
+    class_files = glob.glob(PROJECT_FOLDER_PATH + ALL_CLASSES_REGEX, recursive=True)
     decompileClasses(class_files)
+    xml_files = glob.glob(PROJECT_FOLDER_PATH + ALL_XML_REGEX, recursive=True)
     beautifyXML(xml_files)
 
-
-    

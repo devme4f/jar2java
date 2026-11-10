@@ -9,6 +9,7 @@ TMP_DIR_NAME = '.jar2java_tmp'
 LOG_FILE_NAME = 'jar2java.log'
 MAX_HEAP_MB = 16 * 1024
 HEAVY_BYTES = 20_000_000    # bigger jars run alone, with all cpus and memory
+MAX_JAR_MB = 50             # bigger jars are skipped (too heavy to decompile in a reasonable time)
 TIMEOUT_SECONDS = 900       # hard limit for one item: 15 minutes ...
 TIMEOUT_SECONDS_PER_MB = 60 # ... plus 1 minute per mb
 STALL_SECONDS = 600         # vineflower silent for this long = stuck
@@ -274,7 +275,13 @@ def inspectArchive(path):
     for n in names:
         if n.startswith(('/', '\\')) or '..' in re.split(r'[\\/]', n) or re.match(r'^[A-Za-z]:', n):
             return f'unsafe entry path in archive (zip slip): {n!r}', 0
-    return None, sum(1 for n in names if n.endswith('.class') and '$' not in n.rsplit('/', 1)[-1])
+    # a class with '$' in its name is an inner class only when its outer class is there too,
+    # clojure / scala style names like 'core$fn__12' are classes of their own
+    classes = {n[:-len('.class')] for n in names if n.endswith('.class')}
+    def inner(c):
+        folder, _, base = c.rpartition('/')
+        return '$' in base and (folder + '/' if folder else '') + base.split('$')[0] in classes
+    return None, sum(1 for c in classes if not inner(c))
 
 def decompileJar(conf, job, heap_mb, threads):
     job.error, class_count = inspectArchive(job.path)
@@ -429,17 +436,22 @@ def walk(folder):
             dirnames.remove(TMP_DIR_NAME)
         yield dirpath, filenames
 
-def findArchives(folder, skip):
-    jobs = []
+def findArchives(folder, skip, max_mb):
+    # returns (jobs, archives that are too big to be decompiled)
+    jobs, too_big = [], []
     for dirpath, filenames in walk(folder):
         for f in filenames:
             path = os.path.join(dirpath, f)
             if f.lower().endswith(ARCHIVE_EXTS) and path not in skip:
                 try:
-                    jobs.append(Job('jar', path, os.path.getsize(path)))
+                    job = Job('jar', path, os.path.getsize(path))
                 except OSError:
-                    pass
-    return jobs
+                    continue
+                if max_mb and job.size > max_mb * 1_000_000:
+                    too_big.append(job)
+                else:
+                    jobs.append(job)
+    return jobs, too_big
 
 def classPackage(class_file):
     # package of a compiled class as a relative folder ('com/acme'), read from the constant pool
@@ -529,11 +541,14 @@ def beautifyXML(folder):
 
 # ---------- main ----------
 
-def writeLog(folder, failed, warnings, summary):
+def writeLog(folder, failed, skipped, warnings, summary):
     log_file = os.path.join(folder, LOG_FILE_NAME)
     try:
         with open(log_file, 'w', encoding='utf-8', errors='replace') as f:
             f.write('\n'.join(summary) + '\n')
+            if skipped:
+                f.write('\n===== SKIPPED, TOO BIG (left untouched) =====\n')
+                f.write(''.join(f'{job.path} ({job.size / 1_000_000:.0f} mb)\n' for job in skipped))
             if failed:
                 f.write('\n===== FAILED =====\n')
                 for job in failed:
@@ -555,6 +570,8 @@ def main():
     parser.add_argument('-f', '--folder', required=True, help='folder contain jar/class files')
     parser.add_argument('-jp', '--java-path', default='java', help='specify java binary path (jdk >= 17)')
     parser.add_argument('-t', '--thread', type=int, help='how many decompilers run in parallel, default is automatic')
+    parser.add_argument('-m', '--max-mb', type=int, default=MAX_JAR_MB,
+                        help=f'skip jar files bigger than this, default is {MAX_JAR_MB} (mb), 0 = no limit')
     args = parser.parse_args()
 
     folder = os.path.abspath(args.folder.strip().strip('"'))
@@ -573,18 +590,21 @@ def main():
         sys.exit(f'ERROR: cannot remove old temporary folder: {conf.tmp_dir}')
 
     start = time.time()
-    failed, warnings = [], []
+    failed, skipped, warnings = [], [], []
     done_jars = done_trees = 0
     try:
         # jars: repeat until no new (nested) jar shows up - fat jars / wars contain more jars
         progress = Progress('jars')
         seen, round_no = set(), 0
         while not STOPPING.is_set():
-            jobs = findArchives(folder, seen)
+            jobs, too_big = findArchives(folder, seen, args.max_mb)
+            seen.update(j.path for j in jobs + too_big)
+            skipped += too_big
+            for job in too_big:
+                progress.message(f'SKIPPED: {job.name()} is too big ({job.size / 1_000_000:.0f} mb > {args.max_mb} mb), left untouched')
             if not jobs:
                 break
             round_no += 1
-            seen.update(j.path for j in jobs)
             progress.add(jobs)
             progress.message(f'STATUS: found {len(jobs)} ' + ('jar files' if round_no == 1 else 'nested jar files'))
             round_failed = runAll(conf, jobs, progress, workers, heap_total_mb)
@@ -622,13 +642,16 @@ def main():
                f'jars decompiled: {done_jars}',
                f'class folders decompiled: {done_trees}',
                f'failed: {len(failed)}',
+               f'skipped (too big): {len(skipped)}',
                f'methods/classes vineflower could not decompile: {len(warnings)}']
     print('\n===== SUMMARY =====')
     print('\n'.join(summary[1:]))
+    for job in skipped:
+        print(f'SKIPPED: {job.path} ({job.size / 1_000_000:.0f} mb)')
     for job in failed:
         print(f'FAILED: {job.path}: {job.error}')
-    if failed or warnings:
-        log_file = writeLog(folder, failed, warnings, summary)
+    if failed or skipped or warnings:
+        log_file = writeLog(folder, failed, skipped, warnings, summary)
         if log_file:
             print(f'details: {log_file}')
     if STOPPING.is_set():

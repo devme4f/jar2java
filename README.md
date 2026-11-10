@@ -8,6 +8,7 @@ options:
 -f : folder contain jar file
 -jp : (optional) specify java binary path if it's not available on your path env (jdk >= 17)
 -t : (optional) how many decompilers run in parallel, default is automatic
+-m : (optional) skip jar files bigger than this size in mb, default is 50, use 0 for no limit
 ```
 
 examples:
@@ -22,6 +23,7 @@ python3 main.py -f /path/to/folder/ -jp /opt/jdk17/bin/java
 ## how it works
 - every `.jar/.war/.ear` is decompiled to a folder with the same name next to it, nested jars (fat jar, `WEB-INF/lib`...) are decompiled too
 - loose `.class` files are decompiled per classpath root (e.g. `WEB-INF/classes`), so inner classes are merged into their outer class like in the original source
+- jars bigger than 50mb are skipped and left untouched (too heavy, e.g. clojure uber jars), they are listed in the summary; change the limit with `-m`
 - small jars run in parallel, big jars (> 20mb) run one at a time with all cpus and memory; memory and thread count are picked automatically from the machine
 - progress line shows done/total, %, elapsed, eta and the % done inside the jar being decompiled
 - a failed item (out of memory...) is retried alone with all cpus and memory

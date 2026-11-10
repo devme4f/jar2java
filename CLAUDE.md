@@ -5,7 +5,7 @@ Instructions from the owner. Read before doing any work in this repo.
 ## What this tool is
 
 A simple tool that decompiles Java bytecode (`.jar`, `.class`) to `.java` source,
-used for **security audit / research** (the output gets grepped and read by a human auditor).
+used for **security audit / research** (the output gets grepped and read by auditor).
 
 ## Goals (in priority order)
 

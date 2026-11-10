@@ -22,9 +22,12 @@ python3 main.py -f /path/to/folder/ -jp /opt/jdk17/bin/java
 ## how it works
 - every `.jar/.war/.ear` is decompiled to a folder with the same name next to it, nested jars (fat jar, `WEB-INF/lib`...) are decompiled too
 - loose `.class` files are decompiled per classpath root (e.g. `WEB-INF/classes`), so inner classes are merged into their outer class like in the original source
-- jars run in parallel (biggest first), memory and thread count are picked automatically from the machine
-- progress line shows done/total, %, elapsed and eta
-- a failed item (timeout, out of memory...) is retried once alone with more memory and time; if it still fails the original file is kept and listed in the summary
+- small jars run in parallel, big jars (> 20mb) run one at a time with all cpus and memory; memory and thread count are picked automatically from the machine
+- progress line shows done/total, %, elapsed, eta and the % done inside the jar being decompiled
+- a failed item (out of memory...) is retried alone with all cpus and memory
+- a stuck item (vineflower silent for 10 minutes) is killed and retried with a 120s limit per method (jdk < 20 only), methods over the limit are left undecompiled and listed in `jar2java.log`
+- if an item still fails the original file is kept and listed in the summary; running the tool again only processes what is left
+- a big jar gives no source files until it is completely done (vineflower writes them at the end)
 - corrupt archives and archives with unsafe entry path (zip slip) are skipped and reported
 - minified `.xml` files are beautified
 - summary at the end, details of failures are written to `jar2java.log` in the target folder (exit code is 1 when something failed)

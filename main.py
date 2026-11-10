@@ -1,4 +1,4 @@
-import argparse, glob, os, re, shutil, stat, struct, subprocess, sys, threading, time, zipfile
+import argparse, collections, glob, os, re, shutil, stat, struct, subprocess, sys, threading, time, zipfile
 import xml.dom.minidom
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
@@ -8,6 +8,9 @@ SOURCE_EXTS = ('.java', '.kt')
 TMP_DIR_NAME = '.jar2java_tmp'
 LOG_FILE_NAME = 'jar2java.log'
 MAX_HEAP_MB = 16 * 1024
+HEAVY_BYTES = 20_000_000    # bigger jars run alone, with all cpus and memory
+STALL_SECONDS = 600         # vineflower silent for this long = stuck
+METHOD_SECONDS = 120        # per-method limit, only used when retrying a stuck item
 
 ACTIVE_PROCS = set()
 ACTIVE_LOCK = threading.Lock()
@@ -36,6 +39,7 @@ def checkJavaPath(java_path):
     if m and int(m.group(1)) < 17:
         sys.exit(f'ERROR: java {m.group(1)} is too old, vineflower needs jdk >= 17 (use -jp to point to a newer one)')
     print(f'INFO: java: {out.splitlines()[0].strip() if out.strip() else java_path}')
+    return int(m.group(1)) if m else 17
 
 def totalRamMb():
     try:
@@ -80,16 +84,24 @@ class Progress:
         self.done_bytes += job.size
         self.failed += 0 if ok else 1
 
+    def unfinish(self, job):
+        # a failed job is going to be retried
+        self.done -= 1
+        self.done_bytes -= job.size
+        self.failed -= 1
+
     def line(self):
         elapsed = time.time() - self.start
-        pct = 100 * self.done_bytes / self.total_bytes if self.total_bytes else 100
-        eta = fmtTime(elapsed * (self.total_bytes - self.done_bytes) / self.done_bytes) if self.done_bytes else '--:--'
+        running = sorted(self.running.values(), key=lambda j: -j.size)
+        done_bytes = self.done_bytes + sum(j.size * j.fraction for j in running)
+        pct = 100 * done_bytes / self.total_bytes if self.total_bytes else 100
+        eta = fmtTime(elapsed * (self.total_bytes - done_bytes) / done_bytes) if done_bytes else '--:--'
         text = f'{self.label}: {self.done}/{self.total} {pct:3.0f}% | elapsed {fmtTime(elapsed)} | eta {eta}'
         if self.failed:
             text += f' | failed {self.failed}'
-        if self.running:
-            names = sorted(self.running.values())
-            text += f' | now: {names[0]}' + (f' (+{len(names) - 1})' if len(names) > 1 else '')
+        if running:
+            text += f' | now: {os.path.basename(running[0].path)} {100 * running[0].fraction:.0f}%'
+            text += f' (+{len(running) - 1})' if len(running) > 1 else ''
         return text
 
     def draw(self, force=False):
@@ -124,6 +136,12 @@ class Job:
         self.class_files = []       # kind == 'classes' only
         self.error = None
         self.fatal = False          # True when a retry cannot help
+        self.stalled = False        # last run was killed because vineflower went silent
+        self.solo = False           # runs alone with all cpus and memory
+        self.rescue = False         # runs with a per-method time limit
+        self.history = []           # errors of earlier attempts
+        self.units = 1              # top level classes, for progress inside the job
+        self.fraction = 0           # progress inside the job while it runs, 0..1
         self.output = ''
         self.left = 0               # class files left undecompiled (kind == 'classes')
 
@@ -131,8 +149,9 @@ class Job:
         return os.path.basename(self.path) if self.kind == 'jar' else self.path
 
 class Config:
-    def __init__(self, java, vineflower, tmp_dir):
+    def __init__(self, java, java_major, vineflower, tmp_dir):
         self.java = java
+        self.java_major = java_major
         self.vineflower = vineflower
         self.tmp_dir = tmp_dir
 
@@ -149,11 +168,14 @@ def removeFile(path):
     except OSError:
         pass
 
-def runVineflower(conf, source, dest, size, heap_mb, threads, timeout_factor=1):
-    # returns (error or None, vineflower console output)
-    command = [conf.java, f'-Xmx{heap_mb}m', '-jar', conf.vineflower, '--log-level=warn',
-               f'--thread-count={threads}', source, dest]
-    timeout = (600 + 60 * size / 1_000_000) * timeout_factor
+def runVineflower(conf, job, source, dest, heap_mb, threads):
+    # returns (error or None, vineflower console output); updates job.fraction / job.stalled while running
+    command = [conf.java, f'-Xmx{heap_mb}m', '-jar', conf.vineflower, f'--thread-count={threads}']
+    if job.rescue:
+        command.append(f'--max-time-per-method={METHOD_SECONDS}')
+    command += [source, dest]
+    timeout = 1200 + 120 * job.size / 1_000_000
+    job.fraction, job.stalled = 0, False
     try:
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                 text=True, errors='replace')
@@ -161,20 +183,48 @@ def runVineflower(conf, source, dest, size, heap_mb, threads, timeout_factor=1):
         return f'cannot start java: {e}', ''
     with ACTIVE_LOCK:
         ACTIVE_PROCS.add(proc)
+
+    start = last_output = time.time()
+    killed = []
+    def watchdog():
+        while proc.poll() is None:
+            now = time.time()
+            if now - last_output > STALL_SECONDS:
+                job.stalled = True
+                killed.append(f'stuck, no progress for {fmtTime(STALL_SECONDS)} at {100 * job.fraction:.0f}%')
+            elif now - start > timeout:
+                killed.append(f'timeout after {fmtTime(timeout)} at {100 * job.fraction:.0f}%')
+            if killed:
+                proc.kill()
+                return
+            time.sleep(1)
+    threading.Thread(target=watchdog, daemon=True).start()
+
+    # the INFO log is only used to follow progress; warnings, errors and stack traces are kept
+    kept, tail, started = [], collections.deque(maxlen=60), 0
     try:
-        out, _ = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        out, _ = proc.communicate()
-        return f'timeout after {fmtTime(timeout)}', out
+        for line in proc.stdout:
+            last_output = time.time()
+            if line.startswith('INFO:'):
+                tail.append(line)
+                if 'Preprocessing class' in line:
+                    started += 1
+                    job.fraction = min(0.99, started / job.units)
+            elif len(kept) < 20000:
+                kept.append(line)
+        proc.wait()
     finally:
         with ACTIVE_LOCK:
             ACTIVE_PROCS.discard(proc)
+    out = ''.join(kept)
     if STOPPING.is_set():
         return 'interrupted', out
+    if killed:
+        # the last classes vineflower started are the suspects
+        return killed[0], out + ''.join(tail)
     if proc.returncode != 0:
         reason = 'out of memory' if 'OutOfMemoryError' in out else f'vineflower exit code {proc.returncode}'
-        return reason, out
+        return reason, out + ''.join(tail)
     return None, out
 
 def hasSource(folder):
@@ -184,7 +234,7 @@ def hasSource(folder):
     return False
 
 def inspectArchive(path):
-    # returns (error or None, number of .class entries) - cheap check before starting a JVM
+    # returns (error or None, number of top level classes) - cheap check before starting a JVM
     try:
         with zipfile.ZipFile(path) as z:
             names = z.namelist()
@@ -193,33 +243,34 @@ def inspectArchive(path):
     for n in names:
         if n.startswith(('/', '\\')) or '..' in re.split(r'[\\/]', n) or re.match(r'^[A-Za-z]:', n):
             return f'unsafe entry path in archive (zip slip): {n!r}', 0
-    return None, sum(1 for n in names if n.endswith('.class'))
+    return None, sum(1 for n in names if n.endswith('.class') and '$' not in n.rsplit('/', 1)[-1])
 
-def decompileJar(conf, job, heap_mb, threads, timeout_factor=1):
+def decompileJar(conf, job, heap_mb, threads):
     job.error, class_count = inspectArchive(job.path)
     if job.error:
         job.fatal = True
         return job
+    job.units = max(1, class_count)
     out_folder = os.path.splitext(job.path)[0]
-    job.error, job.output = runVineflower(conf, job.path, out_folder, job.size, heap_mb, threads, timeout_factor)
+    job.error, job.output = runVineflower(conf, job, job.path, out_folder, heap_mb, threads)
     if job.error is None and class_count and not hasSource(out_folder):
         job.error = 'vineflower produced no source files'
     if job.error is None:
         removeFile(job.path)
     return job
 
-def decompileClassTree(conf, job, heap_mb, threads, timeout_factor=1):
+def decompileClassTree(conf, job, heap_mb, threads):
     # loose .class files are packed into a temporary jar so that vineflower sees the whole tree at once
     # (inner classes get merged into their outer class) and never touches anything else in the folder
     work = os.path.join(conf.tmp_dir, f'{threading.get_ident()}_{time.time_ns()}')
     tmp_jar, tmp_out = os.path.join(work, 'classes.jar'), os.path.join(work, 'out')
+    job.units = max(1, sum(1 for f in job.class_files if '$' not in os.path.basename(f)))
     try:
         os.makedirs(tmp_out)
         with zipfile.ZipFile(tmp_jar, 'w', zipfile.ZIP_STORED) as z:
             for f in job.class_files:
                 z.write(f, os.path.relpath(f, job.path))
-        job.error, job.output = runVineflower(conf, tmp_jar, tmp_out, job.size, heap_mb, threads, timeout_factor)
-        # keep whatever was produced, even after a timeout
+        job.error, job.output = runVineflower(conf, job, tmp_jar, tmp_out, heap_mb, threads)
         for dirpath, _, files in os.walk(tmp_out):
             for f in files:
                 if f.endswith(SOURCE_EXTS):
@@ -258,7 +309,7 @@ def runJobs(conf, jobs, progress, workers, heap_total_mb):
         if STOPPING.is_set():
             job.error = 'interrupted'
             return job
-        progress.running[id(job)] = os.path.basename(job.path)
+        progress.running[id(job)] = job
         func = decompileJar if job.kind == 'jar' else decompileClassTree
         try:
             return func(conf, job, heap_mb, threads)
@@ -284,37 +335,47 @@ def runJobs(conf, jobs, progress, workers, heap_total_mb):
                     failed.append(job)
                     if not STOPPING.is_set():
                         progress.message(f'FAILED: {job.name()}: {job.error}')
+                elif job.history:
+                    progress.message(f'RECOVERED: {job.name()}')
             progress.draw()
     return failed
 
-def retryFailed(conf, failed, progress, heap_total_mb):
-    # second chance, one at a time with all the memory/cpu and a doubled timeout
-    retry = [j for j in failed if not j.fatal]
-    still_failed = [j for j in failed if j.fatal]
-    if not retry or STOPPING.is_set():
-        return failed
-    progress.message(f'STATUS: retrying {len(retry)} failed item(s) one by one with more memory and time')
-    heap_mb = int(max(1024, min(MAX_HEAP_MB, heap_total_mb)))
-    for job in retry:
-        if STOPPING.is_set():
-            still_failed.append(job)
-            continue
-        first_error = job.error
-        progress.running[id(job)] = 'retry ' + os.path.basename(job.path)
-        progress.draw(force=True)
-        func = decompileJar if job.kind == 'jar' else decompileClassTree
-        try:
-            func(conf, job, heap_mb, os.cpu_count() or 4, timeout_factor=2)
-        except Exception as e:
-            job.error = f'{type(e).__name__}: {e}'
-        progress.running.pop(id(job), None)
-        if job.error:
-            job.error = f'{first_error}; retry: {job.error}'
-            still_failed.append(job)
-        else:
-            progress.failed -= 1
-            progress.message(f'RECOVERED: {job.name()}')
-    return still_failed
+def planRetry(conf, job):
+    # returns a description of the next attempt, or None when another attempt cannot help
+    if job.fatal or job.error == 'interrupted':
+        return None
+    if job.stalled and not job.rescue and conf.java_major < 20:
+        # vineflower's per-method limit relies on Thread.stop(), gone in java 20+
+        job.solo = job.rescue = True
+        return f'alone, giving up on any method that takes more than {METHOD_SECONDS}s'
+    if not job.solo:
+        job.solo = True
+        return 'alone with all cpus and memory'
+    return None
+
+def runAll(conf, jobs, progress, workers, heap_total_mb):
+    # small jobs in parallel, then big jobs and retries one at a time; returns the jobs that failed for good
+    solo = [j for j in jobs if j.size >= HEAVY_BYTES]
+    for job in solo:
+        job.solo = True
+    if solo and len(solo) < len(jobs):
+        progress.message(f'STATUS: {len(solo)} big item(s) will run alone with all cpus after the others')
+    failed = runJobs(conf, [j for j in jobs if not j.solo], progress, workers, heap_total_mb)
+    final_failed = []
+    while True:
+        for job in failed:
+            plan = None if STOPPING.is_set() else planRetry(conf, job)
+            if plan:
+                progress.unfinish(job)
+                progress.message(f'RETRY: {job.name()}: {plan}')
+                job.history.append(job.error)
+                solo.append(job)
+            else:
+                job.error = '; retry: '.join(job.history + [job.error])
+                final_failed.append(job)
+        if not solo or STOPPING.is_set():
+            return final_failed
+        failed, solo = runJobs(conf, solo, progress, 1, heap_total_mb), []
 
 
 # ---------- scanning ----------
@@ -436,7 +497,7 @@ def writeLog(folder, failed, warnings, summary):
                     f.write(f'\n--- {job.path}\n    {job.error}\n')
                     for c in job.class_files[:200]:
                         f.write(f'    left: {c}\n')
-                    tail = job.output.strip().splitlines()[-40:]
+                    tail = job.output.strip().splitlines()[-100:]
                     f.write(''.join(f'    | {line}\n' for line in tail))
             if warnings:
                 f.write('\n===== METHODS/CLASSES VINEFLOWER COULD NOT DECOMPILE (see "$VF:" comments in the source) =====\n')
@@ -458,8 +519,8 @@ def main():
         sys.exit(f'ERROR: folder not found: {folder}')
     print(f'INFO: Location: {folder}')
 
-    checkJavaPath(args.java_path)
-    conf = Config(args.java_path, findVineflower(), os.path.join(folder, TMP_DIR_NAME))
+    java_major = checkJavaPath(args.java_path)
+    conf = Config(args.java_path, java_major, findVineflower(), os.path.join(folder, TMP_DIR_NAME))
     cpus = os.cpu_count() or 4
     workers = args.thread if args.thread and args.thread > 0 else max(1, min(8, cpus // 4))
     heap_total_mb = totalRamMb() * 0.7
@@ -480,7 +541,7 @@ def main():
             seen.update(j.path for j in jobs)
             progress.add(jobs)
             progress.message(f'STATUS: found {len(jobs)} ' + ('jar files' if round_no == 1 else 'nested jar files'))
-            round_failed = retryFailed(conf, runJobs(conf, jobs, progress, workers, heap_total_mb), progress, heap_total_mb)
+            round_failed = runAll(conf, jobs, progress, workers, heap_total_mb)
             failed += round_failed
             done_jars += len(jobs) - len(round_failed)
             warnings += [f'{j.path}: {l.strip()}' for j in jobs for l in j.output.splitlines() if "couldn't be decompiled" in l]
@@ -494,7 +555,7 @@ def main():
                 progress.add(jobs)
                 total_classes = sum(len(j.class_files) for j in jobs)
                 progress.message(f'STATUS: found {total_classes} loose class files in {len(jobs)} class folders')
-                tree_failed = retryFailed(conf, runJobs(conf, jobs, progress, workers, heap_total_mb), progress, heap_total_mb)
+                tree_failed = runAll(conf, jobs, progress, workers, heap_total_mb)
                 failed += tree_failed
                 done_trees = len(jobs) - len(tree_failed)
                 warnings += [f'{j.path}: {l.strip()}' for j in jobs for l in j.output.splitlines() if "couldn't be decompiled" in l]

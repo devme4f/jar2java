@@ -9,6 +9,8 @@ TMP_DIR_NAME = '.jar2java_tmp'
 LOG_FILE_NAME = 'jar2java.log'
 MAX_HEAP_MB = 16 * 1024
 HEAVY_BYTES = 20_000_000    # bigger jars run alone, with all cpus and memory
+TIMEOUT_SECONDS = 900       # hard limit for one item: 15 minutes ...
+TIMEOUT_SECONDS_PER_MB = 60 # ... plus 1 minute per mb
 STALL_SECONDS = 600         # vineflower silent for this long = stuck
 METHOD_SECONDS = 120        # per-method limit, only used when retrying a stuck item
 
@@ -168,13 +170,42 @@ def removeFile(path):
     except OSError:
         pass
 
+def removeTree(path):
+    # java may hold a file for a moment after it was killed (windows), so try a few times
+    def writable(func, p, _):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+    for _ in range(10):
+        try:
+            shutil.rmtree(path, onerror=writable)
+        except OSError:
+            pass
+        if not os.path.exists(path):
+            return True
+        time.sleep(0.5)
+    return False
+
+def moveTree(src, dst):
+    # move a folder into place, merging when the destination already exists
+    if not os.path.exists(dst):
+        try:
+            os.rename(src, dst)
+            return
+        except OSError:
+            pass
+    for dirpath, _, files in os.walk(src):
+        dest_dir = os.path.join(dst, os.path.relpath(dirpath, src))
+        os.makedirs(dest_dir, exist_ok=True)
+        for f in files:
+            os.replace(os.path.join(dirpath, f), os.path.join(dest_dir, f))
+
 def runVineflower(conf, job, source, dest, heap_mb, threads):
     # returns (error or None, vineflower console output); updates job.fraction / job.stalled while running
     command = [conf.java, f'-Xmx{heap_mb}m', '-jar', conf.vineflower, f'--thread-count={threads}']
     if job.rescue:
         command.append(f'--max-time-per-method={METHOD_SECONDS}')
     command += [source, dest]
-    timeout = 1200 + 120 * job.size / 1_000_000
+    timeout = TIMEOUT_SECONDS + TIMEOUT_SECONDS_PER_MB * job.size / 1_000_000
     job.fraction, job.stalled = 0, False
     try:
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
@@ -251,10 +282,21 @@ def decompileJar(conf, job, heap_mb, threads):
         job.fatal = True
         return job
     job.units = max(1, class_count)
-    out_folder = os.path.splitext(job.path)[0]
-    job.error, job.output = runVineflower(conf, job, job.path, out_folder, heap_mb, threads)
-    if job.error is None and class_count and not hasSource(out_folder):
-        job.error = 'vineflower produced no source files'
+    # vineflower writes into a temporary folder which only replaces the jar when everything went fine,
+    # a failed / stuck / interrupted jar leaves nothing behind
+    work = os.path.join(conf.tmp_dir, f'{threading.get_ident()}_{time.time_ns()}')
+    tmp_out = os.path.join(work, 'out')
+    try:
+        os.makedirs(tmp_out)
+        job.error, job.output = runVineflower(conf, job, job.path, tmp_out, heap_mb, threads)
+        if job.error is None and class_count and not hasSource(tmp_out):
+            job.error = 'vineflower produced no source files'
+        if job.error is None:
+            moveTree(tmp_out, os.path.splitext(job.path)[0])
+    except OSError as e:
+        job.error = job.error or f'{type(e).__name__}: {e}'
+    finally:
+        removeTree(work)
     if job.error is None:
         removeFile(job.path)
     return job
@@ -280,7 +322,7 @@ def decompileClassTree(conf, job, heap_mb, threads):
     except OSError as e:
         job.error = job.error or f'{type(e).__name__}: {e}'
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        removeTree(work)
 
     left = []
     for f in job.class_files:
@@ -321,23 +363,24 @@ def runJobs(conf, jobs, progress, workers, heap_total_mb):
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = {pool.submit(run, j) for j in sorted(jobs, key=lambda j: -j.size)}
-        while pending:
-            try:
+        try:
+            while pending:
                 done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
-            except KeyboardInterrupt:
-                stopAll()
-                pool.shutdown(wait=True, cancel_futures=True)
-                raise
-            for fut in done:
-                job = fut.result()
-                progress.finish(job, job.error is None)
-                if job.error:
-                    failed.append(job)
-                    if not STOPPING.is_set():
-                        progress.message(f'FAILED: {job.name()}: {job.error}')
-                elif job.history:
-                    progress.message(f'RECOVERED: {job.name()}')
-            progress.draw()
+                for fut in done:
+                    job = fut.result()
+                    progress.finish(job, job.error is None)
+                    if job.error:
+                        failed.append(job)
+                        if not STOPPING.is_set():
+                            progress.message(f'FAILED: {job.name()}: {job.error}')
+                    elif job.history:
+                        progress.message(f'RECOVERED: {job.name()}')
+                progress.draw()
+        except KeyboardInterrupt:
+            # kill the running decompilers, drop the queued ones, wait for the workers to clean up
+            stopAll()
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
     return failed
 
 def planRetry(conf, job):
@@ -526,6 +569,9 @@ def main():
     heap_total_mb = totalRamMb() * 0.7
     print(f'INFO: {os.path.basename(conf.vineflower)}, {cpus} cpus, up to {workers} parallel decompilers')
 
+    if os.path.exists(conf.tmp_dir) and not removeTree(conf.tmp_dir):     # left by a run that was killed hard
+        sys.exit(f'ERROR: cannot remove old temporary folder: {conf.tmp_dir}')
+
     start = time.time()
     failed, warnings = [], []
     done_jars = done_trees = 0
@@ -567,7 +613,8 @@ def main():
         stopAll()
         print('\nINTERRUPTED: stopping, files not decompiled yet are left untouched')
     finally:
-        shutil.rmtree(conf.tmp_dir, ignore_errors=True)
+        if os.path.exists(conf.tmp_dir) and not removeTree(conf.tmp_dir):
+            print(f'WARNING: could not remove temporary folder: {conf.tmp_dir}')
 
     failed = [j for j in failed if j.error != 'interrupted']
     summary = [f'jar2java summary for {folder}',

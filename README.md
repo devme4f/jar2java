@@ -26,7 +26,9 @@ python3 main.py -f /path/to/folder/ -jp /opt/jdk17/bin/java
 - progress line shows done/total, %, elapsed, eta and the % done inside the jar being decompiled
 - a failed item (out of memory...) is retried alone with all cpus and memory
 - a stuck item (vineflower silent for 10 minutes) is killed and retried with a 120s limit per method (jdk < 20 only), methods over the limit are left undecompiled and listed in `jar2java.log`
+- every item also has a hard time limit (15 minutes + 1 minute per mb), a big file can not hang the tool
 - if an item still fails the original file is kept and listed in the summary; running the tool again only processes what is left
+- a jar is decompiled in a temporary folder (`.jar2java_tmp` in the target folder) which only replaces the jar when everything went fine: a failed, stuck or interrupted (Ctrl+C) item leaves no partial output and no java process behind
 - a big jar gives no source files until it is completely done (vineflower writes them at the end)
 - corrupt archives and archives with unsafe entry path (zip slip) are skipped and reported
 - minified `.xml` files are beautified
